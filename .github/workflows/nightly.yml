@@ -97,14 +97,23 @@ jobs:
 
       - name: Install go-winres
         run: go install github.com/tc-hib/go-winres@latest
+        env:
+          GOOS: linux
+          GOARCH: amd64
 
       - name: Generate Windows resources
         run: go-winres make --in web/backend/winres/winres.json --out web/backend/rsrc --product-version=${{ env.VERSION }} --file-version=${{ env.VERSION }}
+        env:
+          GOOS: linux
+          GOARCH: amd64
 
       - name: Prepare build
         run: |
           go mod tidy
           go generate ./...
+        env:
+          GOOS: linux
+          GOARCH: amd64
 
       - name: Set ldflags
         id: ldflags
