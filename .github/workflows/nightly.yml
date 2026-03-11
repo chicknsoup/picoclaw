@@ -54,13 +54,20 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
-  release:
-    name: GoReleaser Release
+  build-windows:
+    name: Build Windows Binaries
     needs: create-tag
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      packages: write
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+    env:
+      GOOS: windows
+      GOARCH: ${{ matrix.goarch }}
+      CGO_ENABLED: "0"
+      VERSION: ${{ needs.create-tag.outputs.version }}
     steps:
       - name: Checkout tag
         uses: actions/checkout@v6
@@ -82,47 +89,77 @@ jobs:
       - name: Setup pnpm
         run: corepack enable && corepack prepare pnpm@latest --activate
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Build frontend
+        run: |
+          cd web/frontend
+          pnpm install
+          pnpm build:backend
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Install go-winres
+        run: go install github.com/tc-hib/go-winres@latest
 
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+      - name: Generate Windows resources
+        run: go-winres make --in web/backend/winres/winres.json --out web/backend/rsrc --product-version=${{ env.VERSION }} --file-version=${{ env.VERSION }}
+
+      - name: Prepare build
+        run: |
+          go mod tidy
+          go generate ./...
+
+      - name: Set ldflags
+        id: ldflags
+        run: |
+          LDFLAGS="-s -w"
+          LDFLAGS="$LDFLAGS -X github.com/sipeed/picoclaw/pkg/config.Version=${{ env.VERSION }}"
+          LDFLAGS="$LDFLAGS -X github.com/sipeed/picoclaw/pkg/config.GitCommit=$(git rev-parse --short HEAD)"
+          LDFLAGS="$LDFLAGS -X github.com/sipeed/picoclaw/pkg/config.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="$LDFLAGS -X github.com/sipeed/picoclaw/pkg/config.GoVersion=${{ steps.setup-go.outputs.go-version }}"
+          echo "flags=$LDFLAGS" >> "$GITHUB_OUTPUT"
+
+      - name: Build picoclaw
+        run: go build -tags stdjson -ldflags '${{ steps.ldflags.outputs.flags }}' -o dist/picoclaw.exe ./cmd/picoclaw
+
+      - name: Build picoclaw-launcher
+        run: go build -tags stdjson -ldflags '-s -w' -o dist/picoclaw-launcher.exe ./web/backend
+
+      - name: Build picoclaw-launcher-tui
+        run: go build -tags stdjson -ldflags '-s -w' -o dist/picoclaw-launcher-tui.exe ./cmd/picoclaw-launcher-tui
+
+      - name: Create archive
+        run: |
+          ARCH=${{ matrix.goarch }}
+          if [ "$ARCH" = "amd64" ]; then
+            ARCH_NAME="x86_64"
+          else
+            ARCH_NAME="$ARCH"
+          fi
+          ARCHIVE_NAME="picoclaw_Windows_${ARCH_NAME}.zip"
+          cd dist
+          zip "../${ARCHIVE_NAME}" picoclaw.exe picoclaw-launcher.exe picoclaw-launcher-tui.exe
+          cd ..
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
-        with:
-          distribution: goreleaser
-          version: ~> v2
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-          DOCKERHUB_IMAGE_NAME: ${{ vars.DOCKERHUB_REPOSITORY }}
-          GOVERSION: ${{ steps.setup-go.outputs.go-version }}
-          NIGHTLY_BUILD: "true"
-          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
-          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
-          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
-          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          name: windows-${{ matrix.goarch }}
+          path: ${{ env.ARCHIVE_NAME }}
 
   update-rolling:
     name: Update Rolling Nightly
-    needs: [create-tag, release]
+    needs: [create-tag, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: build
+          merge-multiple: true
 
       - name: Update nightly release
         env:
@@ -139,22 +176,6 @@ jobs:
           ${CHANGELOG}
           EOF
           )
-          
-          # Download assets from the newly created release if it exists,
-          # otherwise fall back to using locally built dist/ artifacts.
-          mkdir -p build
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Downloading assets from GitHub release for $TAG..."
-            gh release download "$TAG" --dir build
-          else
-            echo "GitHub release for $TAG not found; falling back to local dist/ artifacts..."
-            if [ -d "dist" ]; then
-              cp -R dist/* build/
-            else
-              echo "Error: no GitHub release for $TAG and no local dist/ directory found." >&2
-              exit 1
-            fi
-          fi
           
           # Delete existing nightly release and tag to avoid conflicts
           echo "Deleting existing nightly release and tag..."
@@ -173,32 +194,5 @@ jobs:
             if [ -n "$old_tag" ] && [ "$old_tag" != "$TAG" ]; then
               echo "Deleting old nightly release: $old_tag"
               gh release delete "$old_tag" --cleanup-tag -y || true
-            fi
-          done
-          
-          echo "Cleaning up old 'vX.X.X-nightly...' Docker images on GHCR..."
-          OWNER="${{ github.repository_owner }}"
-          PACKAGE_NAME="${{ github.event.repository.name }}"
-          
-          # Check if owner is an organization or user
-          ORG_TEST=$(gh api -H "Accept: application/vnd.github+json" /orgs/$OWNER 2>/dev/null || true)
-          if echo "$ORG_TEST" | grep -q '"login"'; then
-            ACCOUNT_TYPE="orgs"
-          else
-            ACCOUNT_TYPE="users"
-          fi
-          
-          PACKAGE_URL="/${ACCOUNT_TYPE}/${OWNER}/packages/container/${PACKAGE_NAME}/versions"
-          OLD_NIGHTLY_VERSIONS=$(gh api --paginate -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "$PACKAGE_URL" \
-            --jq ". | map(select(any(.metadata.container.tags[]; contains(\"-nightly.\") and (. != \"nightly\") and (. != \"$TAG\")))) | .[].id" 2>/dev/null || true)
-            
-          for version_id in $OLD_NIGHTLY_VERSIONS; do
-            if [ -n "$version_id" ]; then
-              echo "Deleting Docker image version ID: $version_id"
-              gh api -X DELETE -H "Accept: application/vnd.github+json" \
-                -H "X-GitHub-Api-Version: 2022-11-28" \
-                "/${ACCOUNT_TYPE}/${OWNER}/packages/container/${PACKAGE_NAME}/versions/$version_id" || true
             fi
           done
