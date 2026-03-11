@@ -57,6 +57,11 @@ func WithRequestTimeout(timeout time.Duration) Option {
 func NewProvider(apiKey, apiBase, proxy string, opts ...Option) *Provider {
 	client := &http.Client{
 		Timeout: defaultRequestTimeout,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
 	}
 
 	if proxy != "" {
